@@ -30,6 +30,17 @@ app.secret_key = os.environ.get("SECRET_KEY","xfk_2025")
 JWT_SECRET = os.environ.get("JWT_SECRET","xfk_jwt_2025")
 JWT_ALGO = "HS256"; DB = "expenseflowx.db"
 
+import traceback
+@app.errorhandler(Exception)
+def handle_exception(e):
+    try:
+        with open("error.log", "a", encoding="utf-8") as f:
+            f.write(f"=== ERROR {datetime.now().isoformat()} ===\n")
+            traceback.print_exc(file=f)
+    except:
+        pass
+    return jsonify(ok=False, error=str(e)), 500
+
 
 # ── DATABASE ────────────────────────────────────────────────
 def get_db():
@@ -68,18 +79,21 @@ init_db()
 def hash_pw(pw,salt): return hashlib.pbkdf2_hmac("sha256",pw.encode(),salt.encode(),260000).hex()
 def new_salt(): return uuid.uuid4().hex+uuid.uuid4().hex
 def mk_access(uid,role):
-    return pyjwt.encode({"sub":uid,"role":role,
+    token = pyjwt.encode({"sub":uid,"role":role,
         "exp":datetime.now(timezone.utc)+timedelta(minutes=60),
         "jti":uuid.uuid4().hex},JWT_SECRET,algorithm=JWT_ALGO)
+    if isinstance(token, bytes):
+        return token.decode('utf-8')
+    return token
 def mk_refresh(uid):
     tok=uuid.uuid4().hex*2
     exp=(datetime.now(timezone.utc)+timedelta(days=7)).isoformat()
-    with get_db() as c: c.execute("INSERT INTO refresh_tokens VALUES(?,?,?)",(tok,uid,exp))
+    with get_db() as c: c.execute("INSERT INTO refresh_tokens (token,user_id,expires) VALUES(?,?,?)",(tok,uid,exp))
     return tok
 def decode_tok(tok): return pyjwt.decode(tok,JWT_SECRET,algorithms=[JWT_ALGO])
 def audit(uid,action,detail="",ip=""):
     with get_db() as c:
-        c.execute("INSERT INTO audit_logs VALUES(?,?,?,?,?,?)",
+        c.execute("INSERT INTO audit_logs (id,user_id,action,detail,ip,ts) VALUES(?,?,?,?,?,?)",
                   (uuid.uuid4().hex[:8],uid,action,detail,ip,datetime.now().isoformat()))
 def get_token():
     h=request.headers.get("Authorization","").replace("Bearer ","").strip()
@@ -129,7 +143,7 @@ def run_fraud(uid,exp):
 def store_fraud(uid,eid,alerts):
     with get_db() as c:
         for a in alerts:
-            c.execute("INSERT INTO fraud_alerts VALUES(?,?,?,?,?,?,0)",
+            c.execute("INSERT INTO fraud_alerts (id,user_id,expense_id,reason,score,ts,dismissed) VALUES(?,?,?,?,?,?,0)",
                       (uuid.uuid4().hex[:8],uid,eid,a["reason"],a.get("score",0),datetime.now().isoformat()))
 
 
@@ -701,29 +715,35 @@ def index(): return PAGE
 
 @app.route("/api/register", methods=["POST"])
 def reg():
-    d=request.json; u=d.get("username","").strip(); pw=d.get("password",""); em=d.get("email","").strip() or None
+    d=request.json or {}; u=d.get("username","").strip(); pw=d.get("password",""); em=d.get("email","").strip() or None
     if not u or not pw: return jsonify(ok=False,error="Username and password required")
     if len(pw)<8: return jsonify(ok=False,error="Password min 8 chars")
     with get_db() as c:
         if c.execute("SELECT 1 FROM users WHERE username=?",(u,)).fetchone(): return jsonify(ok=False,error="Username taken")
     salt=new_salt(); uid=uuid.uuid4().hex[:12]
     with get_db() as c:
-        c.execute("INSERT INTO users VALUES(?,?,?,?,?,?,?,?)",(uid,u,em,hash_pw(pw,salt),salt,"user",datetime.now().isoformat(),None))
+        c.execute("INSERT INTO users (id,username,email,password,salt,role,created,last_login) VALUES(?,?,?,?,?,?,?,?)",(uid,u,em,hash_pw(pw,salt),salt,"user",datetime.now().isoformat(),None))
     audit(uid,"register",u,request.remote_addr); return jsonify(ok=True)
 
 @app.route("/api/login", methods=["POST"])
 def login():
-    d=request.json; u=d.get("username","").strip(); pw=d.get("password","")
+    d=request.json or {}; u=d.get("username","").strip(); pw=d.get("password","")
     with get_db() as c: row=c.execute("SELECT * FROM users WHERE username=?",(u,)).fetchone()
     if not row or hash_pw(pw,row["salt"])!=row["password"]: return jsonify(ok=False,error="Invalid credentials")
     with get_db() as c: c.execute("UPDATE users SET last_login=? WHERE id=?",(datetime.now().isoformat(),row["id"]))
-    access=mk_access(row["id"],row["role"]); refresh=mk_refresh(row["id"])
+    access=mk_access(row["id"],row["role"])
+    if isinstance(access, bytes):
+        access = access.decode('utf-8')
+    refresh=mk_refresh(row["id"])
+    if isinstance(refresh, bytes):
+        refresh = refresh.decode('utf-8')
     audit(row["id"],"login",u,request.remote_addr)
     return jsonify(ok=True,access_token=access,refresh_token=refresh,role=row["role"],user=u)
 
 @app.route("/api/refresh", methods=["POST"])
 def refresh_token():
-    rt=request.json.get("refresh_token","")
+    d=request.json or {}
+    rt=d.get("refresh_token","")
     with get_db() as c: row=c.execute("SELECT * FROM refresh_tokens WHERE token=?",(rt,)).fetchone()
     if not row: return jsonify(ok=False,error="Invalid refresh token")
     if datetime.fromisoformat(row["expires"])<datetime.now(timezone.utc): return jsonify(ok=False,error="Refresh token expired")
@@ -748,12 +768,12 @@ def me():
 @app.route("/api/expense/add", methods=["POST"])
 @require_auth
 def add_expense():
-    d=request.json; eid=uuid.uuid4().hex[:8]; date=d.get("date") or datetime.now().strftime("%Y-%m-%d")
-    exp=dict(name=d["name"],amount=float(d["amount"]),category=d["category"])
+    d=request.json or {}; eid=uuid.uuid4().hex[:8]; date=d.get("date") or datetime.now().strftime("%Y-%m-%d")
+    exp=dict(name=d.get("name",""),amount=float(d.get("amount",0)),category=d.get("category",""))
     alerts=run_fraud(g.user_id,exp); is_fraud=1 if alerts else 0
     with get_db() as c:
-        c.execute("INSERT INTO expenses VALUES(?,?,?,?,?,?,?,?,?)",
-                  (eid,g.user_id,d["name"],float(d["amount"]),d["category"],d["payment"],date,d.get("note",""),is_fraud))
+        c.execute("INSERT INTO expenses (id,user_id,name,amount,category,payment,date,note,is_fraud) VALUES(?,?,?,?,?,?,?,?,?)",
+                  (eid,g.user_id,d.get("name",""),float(d.get("amount",0)),d.get("category",""),d.get("payment",""),date,d.get("note",""),is_fraud))
     if alerts: store_fraud(g.user_id,eid,alerts)
     audit(g.user_id,"add_expense",f"{d['name']} {d['amount']}")
     return jsonify(ok=True,id=eid,fraud_alerts=alerts)
@@ -768,7 +788,8 @@ def get_expenses():
 @app.route("/api/expense/delete", methods=["POST"])
 @require_auth
 def del_expense():
-    eid=request.json.get("id")
+    d=request.json or {}
+    eid=d.get("id")
     with get_db() as c: c.execute("DELETE FROM expenses WHERE id=? AND user_id=?",(eid,g.user_id))
     audit(g.user_id,"delete_expense",eid); return jsonify(ok=True)
 
@@ -796,7 +817,8 @@ def stats():
 @app.route("/api/copilot", methods=["POST"])
 @require_auth
 def copilot():
-    msg=request.json.get("message","")
+    d=request.json or {}
+    msg=d.get("message","")
     if not msg: return jsonify(ok=False,error="Empty message")
     ctx=fin_ctx(g.user_id)
     import urllib.request, json as _j
@@ -836,11 +858,11 @@ def charts():
 @app.route("/api/budget/set", methods=["POST"])
 @require_auth
 def budget_set():
-    d=request.json; cat=d.get("category",""); amt=float(d.get("amount",0)); now=datetime.now().strftime("%Y-%m")
+    d=request.json or {}; cat=d.get("category",""); amt=float(d.get("amount",0)); now=datetime.now().strftime("%Y-%m")
     with get_db() as c:
         ex=c.execute("SELECT id FROM budgets WHERE user_id=? AND category=? AND month=?",(g.user_id,cat,now)).fetchone()
         if ex: c.execute("UPDATE budgets SET monthly=? WHERE id=?",(amt,ex["id"]))
-        else: c.execute("INSERT INTO budgets VALUES(?,?,?,?,?)",(uuid.uuid4().hex[:8],g.user_id,cat,amt,now))
+        else: c.execute("INSERT INTO budgets (id,user_id,category,monthly,month) VALUES(?,?,?,?,?)",(uuid.uuid4().hex[:8],g.user_id,cat,amt,now))
     return jsonify(ok=True)
 
 @app.route("/api/budget/overview")
@@ -858,10 +880,10 @@ def budget_overview():
 @app.route("/api/goal/add", methods=["POST"])
 @require_auth
 def goal_add():
-    d=request.json
+    d=request.json or {}
     with get_db() as c:
-        c.execute("INSERT INTO goals VALUES(?,?,?,?,?,?,?,?)",
-                  (uuid.uuid4().hex[:8],g.user_id,d["name"],float(d["target"]),float(d.get("saved",0)),d.get("deadline",""),d.get("category",""),datetime.now().isoformat()))
+        c.execute("INSERT INTO goals (id,user_id,name,target,saved,deadline,category,created) VALUES(?,?,?,?,?,?,?,?)",
+                  (uuid.uuid4().hex[:8],g.user_id,d.get("name",""),float(d.get("target",0)),float(d.get("saved",0)),d.get("deadline",""),d.get("category",""),datetime.now().isoformat()))
     return jsonify(ok=True)
 
 @app.route("/api/goals")
@@ -873,28 +895,29 @@ def get_goals():
 @app.route("/api/goal/topup", methods=["POST"])
 @require_auth
 def goal_topup():
-    d=request.json
+    d=request.json or {}
     with get_db() as c:
-        row=c.execute("SELECT saved FROM goals WHERE id=? AND user_id=?",(d["id"],g.user_id)).fetchone()
+        row=c.execute("SELECT saved FROM goals WHERE id=? AND user_id=?",(d.get("id"),g.user_id)).fetchone()
         if not row: return jsonify(ok=False,error="Not found")
-        ns=round(row["saved"]+float(d["amount"]),2)
-        c.execute("UPDATE goals SET saved=? WHERE id=?",(ns,d["id"]))
+        ns=round(row["saved"]+float(d.get("amount",0)),2)
+        c.execute("UPDATE goals SET saved=? WHERE id=?",(ns,d.get("id")))
     return jsonify(ok=True,saved=ns)
 
 @app.route("/api/goal/delete", methods=["POST"])
 @require_auth
 def goal_delete():
-    with get_db() as c: c.execute("DELETE FROM goals WHERE id=? AND user_id=?",(request.json["id"],g.user_id))
+    d=request.json or {}
+    with get_db() as c: c.execute("DELETE FROM goals WHERE id=? AND user_id=?",(d.get("id"),g.user_id))
     return jsonify(ok=True)
 
 # ── ROUTES: SUBSCRIPTIONS ─────────────────────────────────────
 @app.route("/api/sub/add", methods=["POST"])
 @require_auth
 def sub_add():
-    d=request.json
+    d=request.json or {}
     with get_db() as c:
-        c.execute("INSERT INTO subscriptions VALUES(?,?,?,?,?,?,1)",
-                  (uuid.uuid4().hex[:8],g.user_id,d["name"],float(d["amount"]),d["cycle"],d.get("due","")))
+        c.execute("INSERT INTO subscriptions (id,user_id,name,amount,cycle,next_due,active) VALUES(?,?,?,?,?,?,1)",
+                  (uuid.uuid4().hex[:8],g.user_id,d.get("name",""),float(d.get("amount",0)),d.get("cycle",""),d.get("due","")))
     return jsonify(ok=True)
 
 @app.route("/api/subs")
@@ -906,18 +929,19 @@ def get_subs():
 @app.route("/api/sub/delete", methods=["POST"])
 @require_auth
 def sub_delete():
-    with get_db() as c: c.execute("DELETE FROM subscriptions WHERE id=? AND user_id=?",(request.json["id"],g.user_id))
+    d=request.json or {}
+    with get_db() as c: c.execute("DELETE FROM subscriptions WHERE id=? AND user_id=?",(d.get("id"),g.user_id))
     return jsonify(ok=True)
 
 # ── ROUTES: INVESTMENTS ───────────────────────────────────────
 @app.route("/api/invest/add", methods=["POST"])
 @require_auth
 def invest_add():
-    d=request.json
+    d=request.json or {}
     with get_db() as c:
-        c.execute("INSERT INTO investments VALUES(?,?,?,?,?,?,?,?,?)",
-                  (uuid.uuid4().hex[:8],g.user_id,d["name"],d["type"],float(d["amount"]),
-                   d.get("units"),float(d["amount"]),float(d.get("curr_price") or d["amount"]),d["date"]))
+        c.execute("INSERT INTO investments (id,user_id,name,type,amount,units,buy_price,curr_price,date) VALUES(?,?,?,?,?,?,?,?,?)",
+                  (uuid.uuid4().hex[:8],g.user_id,d.get("name",""),d.get("type",""),float(d.get("amount",0)),
+                   d.get("units"),float(d.get("amount",0)),float(d.get("curr_price") or d.get("amount",0)),d.get("date","")))
     return jsonify(ok=True)
 
 @app.route("/api/investments")
@@ -930,7 +954,8 @@ def get_investments():
 @app.route("/api/invest/delete", methods=["POST"])
 @require_auth
 def invest_delete():
-    with get_db() as c: c.execute("DELETE FROM investments WHERE id=? AND user_id=?",(request.json["id"],g.user_id))
+    d=request.json or {}
+    with get_db() as c: c.execute("DELETE FROM investments WHERE id=? AND user_id=?",(d.get("id"),g.user_id))
     return jsonify(ok=True)
 
 # ── ROUTES: FRAUD ─────────────────────────────────────────────
@@ -951,7 +976,8 @@ def fraud_count():
 @app.route("/api/fraud/dismiss", methods=["POST"])
 @require_auth
 def fraud_dismiss():
-    with get_db() as c: c.execute("UPDATE fraud_alerts SET dismissed=1 WHERE id=? AND user_id=?",(request.json["id"],g.user_id))
+    d=request.json or {}
+    with get_db() as c: c.execute("UPDATE fraud_alerts SET dismissed=1 WHERE id=? AND user_id=?",(d.get("id"),g.user_id))
     return jsonify(ok=True)
 
 # ── ROUTES: ADMIN ─────────────────────────────────────────────
@@ -997,4 +1023,4 @@ if __name__=="__main__":
   ║   ANTHROPIC_API_KEY for AI Copilot  ║
   ╚══════════════════════════════════════╝
 \033[0m""")
-    app.run(debug=True,port=8000)
+    app.run(debug=True,port=8000,use_reloader=False)
