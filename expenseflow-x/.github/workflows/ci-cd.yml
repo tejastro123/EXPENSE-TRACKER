@@ -1,0 +1,308 @@
+name: ExpenseFlow X — CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}/expenseflow-x
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────────
+  # QUALITY GATES
+  # ────────────────────────────────────────────────────────────────────────────
+
+  lint-and-type-check:
+    name: 🔍 Lint & Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install linting tools
+        run: pip install ruff mypy black isort
+
+      - name: Run Ruff linter
+        run: ruff check services/ ml/ shared/
+
+      - name: Run Black formatter check
+        run: black --check services/ ml/ shared/
+
+      - name: Run isort check
+        run: isort --check-only services/ ml/ shared/
+
+      - name: Set up Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: npm
+          cache-dependency-path: apps/frontend/package-lock.json
+
+      - name: Frontend type check
+        run: |
+          cd apps/frontend
+          npm ci
+          npm run type-check
+
+      - name: Frontend lint
+        run: |
+          cd apps/frontend
+          npm run lint
+
+  test-backend:
+    name: 🧪 Backend Tests
+    runs-on: ubuntu-latest
+    needs: lint-and-type-check
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: test_efx
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql+asyncpg://test:test@localhost:5432/test_efx
+      REDIS_URL: redis://localhost:6379/0
+      JWT_SECRET_KEY: test-secret-key-at-least-32-characters
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install auth-service deps
+        run: pip install -r services/auth-service/requirements.txt pytest pytest-asyncio httpx
+
+      - name: Run auth-service tests
+        run: |
+          cd services/auth-service
+          pytest tests/ -v --tb=short --asyncio-mode=auto -x
+
+      - name: Install expense-service deps
+        run: pip install -r services/expense-service/requirements.txt pytest pytest-asyncio httpx
+
+      - name: Run expense-service tests
+        run: |
+          cd services/expense-service
+          pytest tests/ -v --tb=short --asyncio-mode=auto -x
+
+      - name: Install AI-service deps (subset)
+        run: pip install fastapi pydantic scikit-learn numpy pytest httpx
+
+      - name: Run AI-service unit tests
+        run: |
+          cd services/ai-service
+          pytest tests/unit/ -v --tb=short -x
+
+  test-frontend:
+    name: 🎨 Frontend Tests
+    runs-on: ubuntu-latest
+    needs: lint-and-type-check
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: npm
+          cache-dependency-path: apps/frontend/package-lock.json
+
+      - name: Install dependencies
+        run: |
+          cd apps/frontend
+          npm ci
+
+      - name: Build Next.js app
+        run: |
+          cd apps/frontend
+          npm run build
+        env:
+          NEXT_PUBLIC_API_URL: http://localhost:8000
+
+  security-scan:
+    name: 🛡️ Security Scan
+    runs-on: ubuntu-latest
+    needs: [test-backend, test-frontend]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: "."
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"
+
+      - name: Run Bandit Python security linter
+        run: |
+          pip install bandit
+          bandit -r services/ -ll -x tests
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # BUILD & PUSH DOCKER IMAGES
+  # ────────────────────────────────────────────────────────────────────────────
+
+  build-and-push:
+    name: 🐳 Build & Push Images
+    runs-on: ubuntu-latest
+    needs: [test-backend, test-frontend, security-scan]
+    if: github.ref == 'refs/heads/main'
+
+    strategy:
+      matrix:
+        service:
+          - name: gateway-service
+            context: ./services/gateway-service
+            port: 8000
+          - name: auth-service
+            context: ./services/auth-service
+            port: 8001
+          - name: expense-service
+            context: ./services/expense-service
+            port: 8002
+          - name: analytics-service
+            context: ./services/analytics-service
+            port: 8003
+          - name: ai-service
+            context: ./services/ai-service
+            port: 8004
+          - name: notification-service
+            context: ./services/notification-service
+            port: 8005
+          - name: admin-service
+            context: ./services/admin-service
+            port: 8006
+          - name: frontend
+            context: ./apps/frontend
+            port: 3000
+          - name: analytics-portal
+            context: ./apps/analytics-portal
+            port: 8501
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_PREFIX }}/${{ matrix.service.name }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.service.context }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # DEPLOY
+  # ────────────────────────────────────────────────────────────────────────────
+
+  deploy-staging:
+    name: 🚀 Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/develop'
+    environment: staging
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to Render (Staging)
+        run: |
+          curl -X POST "${{ secrets.RENDER_DEPLOY_HOOK_STAGING }}"
+
+  deploy-production:
+    name: 🎯 Deploy to Production
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main'
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy Frontend to Vercel
+        run: |
+          npx vercel --prod --token=${{ secrets.VERCEL_TOKEN }}
+        working-directory: apps/frontend
+
+      - name: Deploy Backend to Render
+        run: |
+          curl -X POST "${{ secrets.RENDER_DEPLOY_HOOK_PROD }}"
+
+      - name: Notify Slack on success
+        if: success()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: success
+          text: "✅ ExpenseFlow X deployed to production! SHA: ${{ github.sha }}"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Notify Slack on failure
+        if: failure()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: failure
+          text: "❌ ExpenseFlow X deployment FAILED! SHA: ${{ github.sha }}"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
