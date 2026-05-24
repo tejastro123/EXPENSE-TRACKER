@@ -1,0 +1,113 @@
+# ExpenseFlow X — .gitignore
+# ==============================================================================
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+
+# ── Virtual Environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+.env.local
+
+# ── Environment & Secrets ─────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.cert
+*.crt
+secrets/
+credentials/
+serviceAccountKey.json
+
+# ── Node.js ───────────────────────────────────────────────────────────────────
+node_modules/
+.next/
+.nuxt/
+dist/
+.npm
+.eslintcache
+*.tsbuildinfo
+next-env.d.ts
+.vercel
+
+# ── Database ──────────────────────────────────────────────────────────────────
+*.sqlite
+*.db
+*.db-shm
+*.db-wal
+alembic/versions/*.pyc
+postgres_data/
+
+# ── ML Models (large files) ───────────────────────────────────────────────────
+ml/models/cache/*.joblib
+ml/models/cache/*.pkl
+ml/models/cache/*.h5
+ml/models/cache/*.pt
+ml/models/cache/*.pth
+!ml/models/.gitkeep
+
+# ── Docker ────────────────────────────────────────────────────────────────────
+docker-compose.override.yml
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*.bak
+.DS_Store
+Thumbs.db
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+logs/
+*.log.*
+
+# ── Test Artifacts ────────────────────────────────────────────────────────────
+.coverage
+htmlcov/
+coverage.xml
+*.cover
+.pytest_cache/
+junit/
+test-results/
+
+# ── Uploads ───────────────────────────────────────────────────────────────────
+uploads/
+media/
+receipt_uploads/
+
+# ── Monitoring ───────────────────────────────────────────────────────────────
+prometheus_data/
+grafana_data/
+elasticsearch_data/
